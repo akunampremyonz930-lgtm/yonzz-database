@@ -53,13 +53,53 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+          accept-android-sdk-licenses: true
 
-      - name: Install cmdline-tools & accept licenses
+      - name: Install Android packages
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/cmdline-tools/16.0/bin:$ANDROID_HOME/cmdline-tools/bin:$PATH"
+
+          # Cari sdkmanager
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME" -type f -name sdkmanager 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager tidak ditemukan di ANDROID_HOME=$ANDROID_HOME"
+            ls -la "$ANDROID_HOME" 2>/dev/null || true
+            find "$ANDROID_HOME" -maxdepth 4 -type d 2>/dev/null | head -40 || true
+            exit 1
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+
+          # Accept licenses (abaikan noise)
+          yes 2>/dev/null | "$SDKMANAGER" --licenses >/tmp/sdk-licenses.log 2>&1 || true
+
+          # Install paket yang dibutuhkan (JANGAN install package "tools" — sudah obsolete)
+          # Jangan pipe ke /dev/null supaya error nyata terlihat
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            2>&1 | tee /tmp/sdk-install.log
+
+          # Pastikan setidaknya salah satu build-tools ada
+          if ! ls -d "$ANDROID_HOME"/build-tools/* >/dev/null 2>&1; then
+            echo "::error::build-tools gagal terinstall"
+            cat /tmp/sdk-install.log || true
+            exit 1
+          fi
+
+          echo "Android packages siap."
+          ls -la "$ANDROID_HOME"/build-tools/ || true
+          ls -la "$ANDROID_HOME"/platforms/ || true
 
       - name: Download project ZIP
         shell: bash
@@ -69,36 +109,42 @@ jobs:
           curl -L --fail --retry 3 -o project.zip "${{ inputs.zip_url }}"
           ls -lh project.zip
           unzip -q project.zip -d project
-          # Cari folder yang berisi pubspec.yaml atau build.gradle
+
           if [ -f project/pubspec.yaml ] || [ -f project/android/app/build.gradle ] || [ -f project/android/app/build.gradle.kts ]; then
             echo "PROJECT_DIR=project" >> $GITHUB_ENV
           else
-            SUB=$(find project -maxdepth 3 \( -name pubspec.yaml -o -name build.gradle -o -name build.gradle.kts \) | head -1 | xargs dirname)
+            SUB=$(find project -maxdepth 4 \( -name pubspec.yaml -o -name build.gradle -o -name build.gradle.kts \) | head -1 | xargs dirname)
             if [ -z "$SUB" ]; then
               echo "::error::Tidak menemukan pubspec.yaml / build.gradle di dalam ZIP"
-              find project -maxdepth 3 -type f | head -40
+              find project -maxdepth 4 -type f | head -50 || true
               exit 1
+            fi
+            # Kalau ketemu android/app/build.gradle, naik ke root project
+            if echo "$SUB" | grep -q '/android/app$'; then
+              SUB=$(dirname "$(dirname "$SUB")")
+            elif echo "$SUB" | grep -q '/android$'; then
+              SUB=$(dirname "$SUB")
             fi
             echo "PROJECT_DIR=$SUB" >> $GITHUB_ENV
           fi
-          echo "Project dir: $PROJECT_DIR"
-          ls -la "$PROJECT_DIR"
+          echo "Project dir: ${PROJECT_DIR:-project}"
+          ls -la "${PROJECT_DIR:-project}" | head -30
 
       - name: Detect project type
         id: detect
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
+          cd "${PROJECT_DIR}"
           if [ -f pubspec.yaml ]; then
             echo "type=flutter" >> $GITHUB_OUTPUT
-            echo "Detected: Flutter"
-          elif [ -f android/app/build.gradle ] || [ -f android/app/build.gradle.kts ] || [ -f app/build.gradle ] || [ -f app/build.gradle.kts ]; then
+            echo "Flutter project terdeteksi"
+          elif [ -f android/app/build.gradle ] || [ -f android/app/build.gradle.kts ] || [ -f app/build.gradle ] || [ -f app/build.gradle.kts ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
             echo "type=android" >> $GITHUB_OUTPUT
-            echo "Detected: Native Android"
+            echo "Android/Gradle project terdeteksi"
           else
-            echo "type=unknown" >> $GITHUB_OUTPUT
             echo "::error::Tipe project tidak dikenali"
+            find . -maxdepth 3 -type f | head -40
             exit 1
           fi
 
@@ -109,46 +155,48 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Flutter pub get + build
+      - name: Flutter pub get & build
         if: steps.detect.outputs.type == 'flutter'
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
+          cd "${PROJECT_DIR}"
+          flutter --version
           flutter pub get
           if [ "${{ inputs.build_type }}" = "debug" ]; then
             flutter build apk --debug
             APK=$(find build/app/outputs -name "*.apk" | head -1)
           else
             flutter build apk --release
-            APK=$(find build/app/outputs -name "*release*.apk" | head -1)
+            APK=$(find build/app/outputs -name "*.apk" | head -1)
           fi
           if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "::error::APK tidak ditemukan setelah flutter build"
-            find build -name "*.apk" 2>/dev/null || true
+            echo "::error::APK Flutter tidak ditemukan"
+            find build -name "*.apk" 2>/dev/null | head -20 || true
             exit 1
           fi
           mkdir -p "$GITHUB_WORKSPACE/output"
           cp "$APK" "$GITHUB_WORKSPACE/output/app.apk"
           ls -lh "$GITHUB_WORKSPACE/output/app.apk"
 
-      - name: Native Android build
+      - name: Gradle build (Android native)
         if: steps.detect.outputs.type == 'android'
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
-          # Cari root gradle
+          cd "${PROJECT_DIR}"
+          # Tentukan root gradle (bisa di root atau di subfolder android)
           if [ -f gradlew ]; then
             ROOT="."
-          elif [ -f ../gradlew ]; then
-            ROOT=".."
+          elif [ -f android/gradlew ]; then
+            ROOT="android"
           else
             echo "::error::gradlew tidak ditemukan"
+            find . -name "gradlew" 2>/dev/null | head -10 || true
             exit 1
           fi
           cd "$ROOT"
-          chmod +x gradlew
+          chmod +x ./gradlew
           if [ "${{ inputs.build_type }}" = "debug" ]; then
             ./gradlew assembleDebug --stacktrace
             APK=$(find . -path "*/outputs/apk/debug/*.apk" | head -1)
@@ -172,10 +220,11 @@ jobs:
           APK="$GITHUB_WORKSPACE/output/app.apk"
           [ -f "$APK" ] || { echo "::error::app.apk tidak ada"; exit 1; }
 
-          # Cari build-tools
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
           if [ -z "$BT" ]; then
-            echo "::error::build-tools tidak ditemukan"
+            echo "::error::build-tools tidak ditemukan di $ANDROID_HOME"
+            ls -la "$ANDROID_HOME" 2>/dev/null || true
             exit 1
           fi
           echo "Build-tools: $BT"
